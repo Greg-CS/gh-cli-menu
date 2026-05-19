@@ -4,11 +4,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -28,6 +31,9 @@ const (
 	screenMainMenu
 	screenBranchInput
 	screenCommitInput
+	screenFetchRepoList
+	screenFetchCommitList
+	screenFetchFileList
 	screenOutput
 )
 
@@ -111,6 +117,16 @@ type commitPushMsg struct {
 	err    error
 }
 
+type commitsLoadedMsg struct {
+	commits []string
+	err     error
+}
+
+type filesLoadedMsg struct {
+	files []string
+	err   error
+}
+
 // ---------- model ----------
 
 type AppModel struct {
@@ -118,6 +134,7 @@ type AppModel struct {
 	repo        string
 	repoList    list.Model
 	cmdList     list.Model
+	pickerList  list.Model
 	textInput   textinput.Model
 	outputVP    viewport.Model
 	outputTitle string
@@ -125,10 +142,25 @@ type AppModel struct {
 	height      int
 	quitting    bool
 	lastErr     string
+	// fetchState holds inputs for the "fetch file/folder from commit" flow.
+	fetchSourceRepo string
+	fetchCommit     string
+	fetchPath       string
+	fetchTempDir    string
+	// loading indicator.
+	loading     bool
+	loadingText string
+	spinner     spinner.Model
 }
 
 func NewAppModel() AppModel {
-	return AppModel{screen: screenLoading}
+	s := spinner.New()
+	s.Spinner = spinner.Dot
+	s.Style = ui.SubtitleStyle
+	return AppModel{
+		screen:  screenLoading,
+		spinner: s,
+	}
 }
 
 func newTextInput() textinput.Model {
@@ -159,7 +191,7 @@ func newCommitInput() textinput.Model {
 }
 
 func (m AppModel) Init() tea.Cmd {
-	return detectRepoCmd()
+	return tea.Batch(detectRepoCmd(), m.spinner.Tick)
 }
 
 // detectRepoCmd tries the current directory first; if that fails it fetches the user's repos.
@@ -215,6 +247,175 @@ func commitAndPushCmd(msg string) tea.Cmd {
 	}
 }
 
+func loadCommitsCmd(tmpDir string) tea.Cmd {
+	return func() tea.Msg {
+		out, err := exec.Command("git", "-C", tmpDir, "log", "--oneline", "--all", "-n", "100").CombinedOutput()
+		if err != nil {
+			return commitsLoadedMsg{commits: nil, err: err}
+		}
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		var commits []string
+		for _, line := range lines {
+			if strings.TrimSpace(line) != "" {
+				commits = append(commits, line)
+			}
+		}
+		return commitsLoadedMsg{commits: commits, err: nil}
+	}
+}
+
+func loadFilesCmd(tmpDir, commit string) tea.Cmd {
+	return func() tea.Msg {
+		out, err := exec.Command("git", "-C", tmpDir, "ls-tree", "-r", "--name-only", commit).CombinedOutput()
+		if err != nil {
+			return filesLoadedMsg{files: nil, err: err}
+		}
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		var files []string
+		for _, line := range lines {
+			if strings.TrimSpace(line) != "" {
+				files = append(files, line)
+			}
+		}
+		return filesLoadedMsg{files: files, err: nil}
+	}
+}
+
+func fetchFromCommitCmd(sourceRepo, commit, path string) tea.Cmd {
+	return func() tea.Msg {
+		var out strings.Builder
+		// Create temp directory.
+		tmpDir, err := os.MkdirTemp("", "gh-gum-fetch-*")
+		if err != nil {
+			return cmdOutputMsg{output: out.String(), err: err, label: "Fetch from commit"}
+		}
+		defer os.RemoveAll(tmpDir)
+
+		// Clone source repo.
+		cloneOut, err := exec.Command("gh", "repo", "clone", sourceRepo, tmpDir).CombinedOutput()
+		out.Write(cloneOut)
+		if err != nil {
+			return cmdOutputMsg{output: out.String(), err: err, label: "Fetch from commit"}
+		}
+
+		// Extract the specific path from the commit.
+		checkoutOut, err := exec.Command("git", "-C", tmpDir, "checkout", commit, "--", path).CombinedOutput()
+		out.Write(checkoutOut)
+		if err != nil {
+			return cmdOutputMsg{output: out.String(), err: err, label: "Fetch from commit"}
+		}
+
+		// Copy path to current working directory.
+		srcPath := filepath.Join(tmpDir, path)
+		dstPath := filepath.Base(path)
+
+		info, err := os.Stat(srcPath)
+		if err != nil {
+			return cmdOutputMsg{output: out.String(), err: err, label: "Fetch from commit"}
+		}
+
+		if info.IsDir() {
+			err = copyDir(srcPath, dstPath)
+		} else {
+			err = copyFile(srcPath, dstPath)
+		}
+		if err != nil {
+			return cmdOutputMsg{output: out.String(), err: err, label: "Fetch from commit"}
+		}
+
+		out.WriteString(fmt.Sprintf("\nSuccessfully fetched %s to %s", path, dstPath))
+		return cmdOutputMsg{output: out.String(), err: nil, label: "Fetch from commit"}
+	}
+}
+
+type pickerItem struct{ label string }
+
+func (i pickerItem) FilterValue() string { return i.label }
+
+type pickerDelegate struct{}
+
+func (d pickerDelegate) Height() int                             { return 1 }
+func (d pickerDelegate) Spacing() int                            { return 0 }
+func (d pickerDelegate) Update(_ tea.Msg, _ *list.Model) tea.Cmd { return nil }
+func (d pickerDelegate) Render(w io.Writer, m list.Model, index int, listItem list.Item) {
+	var label string
+	switch i := listItem.(type) {
+	case pickerItem:
+		label = i.label
+	case homeItem:
+		label = i.label
+	default:
+		return
+	}
+	str := ui.MenuItemStyle.Render(label)
+	if index == m.Index() {
+		str = ui.SelectedMenuItemStyle.Render(str)
+	}
+	fmt.Fprint(w, str)
+}
+
+func buildPickerList(items []list.Item, title string, width, height int) list.Model {
+	w, h := width, height
+	if w == 0 {
+		w = 60
+	}
+	if h == 0 {
+		h = 20
+	}
+	l := list.New(items, pickerDelegate{}, w, h)
+	l.Title = title
+	l.SetShowStatusBar(false)
+	l.SetFilteringEnabled(true)
+	l.SetShowHelp(false)
+	l.KeyMap.Quit = key.NewBinding(key.WithKeys("q", "ctrl+c"))
+	l.KeyMap.CancelWhileFiltering = key.NewBinding(key.WithKeys("esc"))
+	l.Styles.Title = ui.TitleStyle
+	l.Styles.FilterPrompt = ui.CursorStyle
+	l.Styles.FilterCursor = ui.CursorStyle
+	return l
+}
+
+func (m *AppModel) cleanupFetchTemp() {
+	if m.fetchTempDir != "" {
+		os.RemoveAll(m.fetchTempDir)
+		m.fetchTempDir = ""
+	}
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, in)
+	return err
+}
+
+func copyDir(src, dst string) error {
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		relPath, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		dstPath := filepath.Join(dst, relPath)
+		if info.IsDir() {
+			return os.MkdirAll(dstPath, info.Mode())
+		}
+		return copyFile(path, dstPath)
+	})
+}
+
 func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -230,9 +431,10 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case screenOutput:
 			m.outputVP.Width = m.width
 			m.outputVP.Height = m.height
+		case screenFetchRepoList, screenFetchCommitList, screenFetchFileList:
 		}
 		return m, nil
-
+	// ...
 	case cmdOutputMsg:
 		m.outputTitle = msg.label
 		content := msg.output
@@ -245,10 +447,29 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case reposLoadedMsg:
+		m.loading = false
 		if msg.err != nil {
 			m.lastErr = fmt.Sprintf("Could not load repos: %v", msg.err)
+			// If we were loading repos for the fetch flow, go back to main menu.
+			if m.screen == screenFetchRepoList {
+				m.screen = screenMainMenu
+				return m, nil
+			}
 			m.screen = screenRepoSelector
 			m.repoList = buildRepoList(nil, m.width, m.height)
+			return m, nil
+		}
+		// Fetch flow: populate picker with repos.
+		if m.screen == screenFetchRepoList || (m.screen == screenMainMenu && m.fetchSourceRepo == "" && m.fetchCommit == "") {
+			var items []list.Item
+			for _, r := range msg.repos {
+				items = append(items, homeItem{label: r, isRepo: true, repo: r})
+			}
+			if len(items) == 0 {
+				items = append(items, homeItem{label: "(no repos found)"})
+			}
+			m.pickerList = buildPickerList(items, "Select source repository", m.width, m.height)
+			m.screen = screenFetchRepoList
 			return m, nil
 		}
 		if len(msg.repos) == 1 && m.repo == "" {
@@ -380,6 +601,83 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.textInput, cmd = m.textInput.Update(msg)
 			return m, cmd
 
+		case screenFetchRepoList:
+			if key.Matches(msg, m.pickerList.KeyMap.Quit) && m.pickerList.FilterState() != list.Filtering {
+				m.quitting = true
+				return m, tea.Quit
+			}
+			if msg.String() == "esc" && m.pickerList.FilterState() != list.Filtering {
+				m.cleanupFetchTemp()
+				m.screen = screenMainMenu
+				return m, nil
+			}
+			if msg.String() == "enter" && m.pickerList.FilterState() != list.Filtering {
+				if i, ok := m.pickerList.SelectedItem().(homeItem); ok && i.isRepo {
+					m.fetchSourceRepo = i.repo
+					// Clone source repo into temp dir to inspect commits.
+					m.loading = true
+					m.loadingText = fmt.Sprintf("Cloning %s...", i.repo)
+					return m, tea.Batch(func() tea.Msg {
+						tmpDir, err := os.MkdirTemp("", "gh-gum-fetch-*")
+						if err != nil {
+							return commitsLoadedMsg{commits: nil, err: err}
+						}
+						_, err = exec.Command("gh", "repo", "clone", i.repo, tmpDir).CombinedOutput()
+						if err != nil {
+							os.RemoveAll(tmpDir)
+							return commitsLoadedMsg{commits: nil, err: err}
+						}
+						m.fetchTempDir = tmpDir
+						return loadCommitsCmd(tmpDir)()
+					}, m.spinner.Tick)
+				}
+			}
+			var cmd tea.Cmd
+			m.pickerList, cmd = m.pickerList.Update(msg)
+			return m, cmd
+
+		case screenFetchCommitList:
+			if key.Matches(msg, m.pickerList.KeyMap.Quit) && m.pickerList.FilterState() != list.Filtering {
+				m.quitting = true
+				return m, tea.Quit
+			}
+			if msg.String() == "esc" && m.pickerList.FilterState() != list.Filtering {
+				m.screen = screenFetchRepoList
+				return m, nil
+			}
+			if msg.String() == "enter" && m.pickerList.FilterState() != list.Filtering {
+				if i, ok := m.pickerList.SelectedItem().(pickerItem); ok {
+					// Extract commit hash from "abc123 message...".
+					parts := strings.SplitN(i.label, " ", 2)
+					if len(parts) > 0 && parts[0] != "" {
+						m.fetchCommit = parts[0]
+						return m, loadFilesCmd(m.fetchTempDir, m.fetchCommit)
+					}
+				}
+			}
+			var cmd tea.Cmd
+			m.pickerList, cmd = m.pickerList.Update(msg)
+			return m, cmd
+
+		case screenFetchFileList:
+			if key.Matches(msg, m.pickerList.KeyMap.Quit) && m.pickerList.FilterState() != list.Filtering {
+				m.quitting = true
+				return m, tea.Quit
+			}
+			if msg.String() == "esc" && m.pickerList.FilterState() != list.Filtering {
+				m.screen = screenFetchCommitList
+				return m, nil
+			}
+			if msg.String() == "enter" && m.pickerList.FilterState() != list.Filtering {
+				if i, ok := m.pickerList.SelectedItem().(pickerItem); ok {
+					m.fetchPath = i.label
+					return m, fetchFromCommitCmd(m.fetchSourceRepo, m.fetchCommit, m.fetchPath)
+				}
+			}
+			var cmd tea.Cmd
+			m.pickerList, cmd = m.pickerList.Update(msg)
+			return m, cmd
+
 		case screenMainMenu:
 			if key.Matches(msg, m.cmdList.KeyMap.Quit) && m.cmdList.FilterState() != list.Filtering {
 				m.quitting = true
@@ -387,7 +685,9 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if msg.String() == "b" && m.cmdList.FilterState() != list.Filtering {
 				// Fetch all repos so the user can switch to a different one.
-				return m, listAllReposCmd()
+				m.loading = true
+				m.loadingText = "Loading repositories..."
+				return m, tea.Batch(listAllReposCmd(), m.spinner.Tick)
 			}
 			if msg.String() == "enter" && m.cmdList.FilterState() != list.Filtering {
 				if i, ok := m.cmdList.SelectedItem().(cmdItem); ok {
@@ -398,6 +698,16 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					if i.action.Label == "Push current branch" {
 						return m, gitStatusCheckCmd()
+					}
+					if i.action.Label == "Fetch file/folder from commit" {
+						m.cleanupFetchTemp()
+						m.fetchSourceRepo = ""
+						m.fetchCommit = ""
+						m.fetchPath = ""
+						// Show repo picker; preload current repo if known.
+						m.loading = true
+						m.loadingText = "Loading repositories..."
+						return m, tea.Batch(listAllReposCmd(), m.spinner.Tick)
 					}
 					if i.action.Interactive {
 						return m, tea.ExecProcess(i.action.Cmd(m.repo), func(err error) tea.Msg {
@@ -430,6 +740,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case commitPushMsg:
+		m.loading = false
 		m.outputTitle = "Commit & Push"
 		content := msg.output
 		if msg.err != nil {
@@ -438,6 +749,44 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.outputVP = viewport.New(m.width, m.height)
 		m.outputVP.SetContent(content)
 		m.screen = screenOutput
+		return m, nil
+
+	case commitsLoadedMsg:
+		m.loading = false
+		if msg.err != nil {
+			m.lastErr = fmt.Sprintf("Could not load commits: %v", msg.err)
+			m.cleanupFetchTemp()
+			m.screen = screenMainMenu
+			return m, nil
+		}
+		var items []list.Item
+		for _, c := range msg.commits {
+			items = append(items, pickerItem{label: c})
+		}
+		if len(items) == 0 {
+			items = append(items, pickerItem{label: "(no commits found)"})
+		}
+		m.pickerList = buildPickerList(items, fmt.Sprintf("Select commit from %s", m.fetchSourceRepo), m.width, m.height)
+		m.screen = screenFetchCommitList
+		return m, nil
+
+	case filesLoadedMsg:
+		m.loading = false
+		if msg.err != nil {
+			m.lastErr = fmt.Sprintf("Could not load files: %v", msg.err)
+			m.cleanupFetchTemp()
+			m.screen = screenMainMenu
+			return m, nil
+		}
+		var items []list.Item
+		for _, f := range msg.files {
+			items = append(items, pickerItem{label: f})
+		}
+		if len(items) == 0 {
+			items = append(items, pickerItem{label: "(no files found)"})
+		}
+		m.pickerList = buildPickerList(items, fmt.Sprintf("Select file/folder from %s", m.fetchCommit), m.width, m.height)
+		m.screen = screenFetchFileList
 		return m, nil
 
 	case execFinishedMsg:
@@ -460,10 +809,21 @@ func (m AppModel) View() string {
 	switch m.screen {
 	case screenLoading:
 		b.WriteString(ui.TitleStyle.Render("gh-gum"))
-		b.WriteString("\n")
-		b.WriteString(ui.SubtitleStyle.Render("Detecting repository..."))
+		b.WriteString("\n\n")
+		if m.loading {
+			b.WriteString(m.spinner.View())
+			b.WriteString(" " + ui.SubtitleStyle.Render(m.loadingText))
+		} else {
+			b.WriteString(ui.SubtitleStyle.Render("Detecting repository..."))
+		}
 
 	case screenRepoSelector:
+		if m.loading {
+			b.WriteString("\n\n")
+			b.WriteString(m.spinner.View())
+			b.WriteString(" " + ui.SubtitleStyle.Render(m.loadingText))
+			break
+		}
 		b.WriteString(m.repoList.View())
 		b.WriteString("\n")
 		if m.repo != "" {
@@ -502,6 +862,12 @@ func (m AppModel) View() string {
 		b.WriteString(ui.StatusBarStyle.Render(help))
 
 	case screenMainMenu:
+		if m.loading {
+			b.WriteString("\n\n")
+			b.WriteString(m.spinner.View())
+			b.WriteString(" " + ui.SubtitleStyle.Render(m.loadingText))
+			break
+		}
 		b.WriteString(m.cmdList.View())
 		b.WriteString("\n")
 		header := ui.SubtitleStyle.Render(fmt.Sprintf("Repository: %s", m.repo))
@@ -540,6 +906,60 @@ func (m AppModel) View() string {
 			"%s %s · %s %s",
 			ui.HelpKeyStyle.Render("enter"), ui.HelpDescStyle.Render("commit & push"),
 			ui.HelpKeyStyle.Render("esc"), ui.HelpDescStyle.Render("cancel"),
+		)
+		b.WriteString(ui.StatusBarStyle.Render(help))
+
+	case screenFetchRepoList:
+		if m.loading {
+			b.WriteString("\n\n")
+			b.WriteString(m.spinner.View())
+			b.WriteString(" " + ui.SubtitleStyle.Render(m.loadingText))
+			break
+		}
+		b.WriteString(m.pickerList.View())
+		b.WriteString("\n")
+		help := fmt.Sprintf(
+			"%s %s · %s %s · %s %s · %s %s",
+			ui.HelpKeyStyle.Render("↑/k"), ui.HelpDescStyle.Render("up"),
+			ui.HelpKeyStyle.Render("↓/j"), ui.HelpDescStyle.Render("down"),
+			ui.HelpKeyStyle.Render("/"), ui.HelpDescStyle.Render("filter"),
+			ui.HelpKeyStyle.Render("esc"), ui.HelpDescStyle.Render("cancel"),
+		)
+		b.WriteString(ui.StatusBarStyle.Render(help))
+
+	case screenFetchCommitList:
+		if m.loading {
+			b.WriteString("\n\n")
+			b.WriteString(m.spinner.View())
+			b.WriteString(" " + ui.SubtitleStyle.Render(m.loadingText))
+			break
+		}
+		b.WriteString(m.pickerList.View())
+		b.WriteString("\n")
+		help := fmt.Sprintf(
+			"%s %s · %s %s · %s %s · %s %s",
+			ui.HelpKeyStyle.Render("↑/k"), ui.HelpDescStyle.Render("up"),
+			ui.HelpKeyStyle.Render("↓/j"), ui.HelpDescStyle.Render("down"),
+			ui.HelpKeyStyle.Render("/"), ui.HelpDescStyle.Render("filter"),
+			ui.HelpKeyStyle.Render("esc"), ui.HelpDescStyle.Render("back"),
+		)
+		b.WriteString(ui.StatusBarStyle.Render(help))
+
+	case screenFetchFileList:
+		if m.loading {
+			b.WriteString("\n\n")
+			b.WriteString(m.spinner.View())
+			b.WriteString(" " + ui.SubtitleStyle.Render(m.loadingText))
+			break
+		}
+		b.WriteString(m.pickerList.View())
+		b.WriteString("\n")
+		help := fmt.Sprintf(
+			"%s %s · %s %s · %s %s · %s %s",
+			ui.HelpKeyStyle.Render("↑/k"), ui.HelpDescStyle.Render("up"),
+			ui.HelpKeyStyle.Render("↓/j"), ui.HelpDescStyle.Render("down"),
+			ui.HelpKeyStyle.Render("/"), ui.HelpDescStyle.Render("filter"),
+			ui.HelpKeyStyle.Render("esc"), ui.HelpDescStyle.Render("back"),
 		)
 		b.WriteString(ui.StatusBarStyle.Render(help))
 

@@ -126,6 +126,9 @@ func Actions() []Action {
 		{Label: "Pop stash", Kind: Local, Interactive: false, Cmd: func(repo string) *exec.Cmd {
 			return exec.Command("git", "stash", "pop")
 		}},
+		{Label: "Fetch file/folder from commit", Kind: Local, Interactive: false, Cmd: func(repo string) *exec.Cmd {
+			return exec.Command("echo", "handled in TUI")
+		}},
 		{Label: "Checkout new branch", Kind: Local, Interactive: true, Cmd: func(repo string) *exec.Cmd {
 			return exec.Command("git", "checkout", "-b")
 		}},
