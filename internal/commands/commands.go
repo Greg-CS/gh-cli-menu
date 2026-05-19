@@ -42,6 +42,9 @@ func (k Kind) String() string {
 type Action struct {
 	Label string
 	Kind  Kind
+	// Interactive commands use ExecProcess and take over the terminal.
+	// Non-interactive commands have their output captured and shown in a viewport.
+	Interactive bool
 	// Cmd returns an *exec.Cmd wired to stdin/stdout/stderr.
 	// The TUI suspends while the command runs and resumes after it exits.
 	// If repo is non-empty, the command should target that owner/name.
@@ -51,55 +54,79 @@ type Action struct {
 // Actions returns the flat list of all available menu actions.
 func Actions() []Action {
 	return []Action{
-		{Label: "List open issues", Kind: Issues, Cmd: func(repo string) *exec.Cmd {
+		// Issues
+		{Label: "List open issues", Kind: Issues, Interactive: false, Cmd: func(repo string) *exec.Cmd {
 			return withRepo(repo, "issue", "list")
 		}},
-		{Label: "Create new issue", Kind: Issues, Cmd: func(repo string) *exec.Cmd {
+		{Label: "Create new issue", Kind: Issues, Interactive: true, Cmd: func(repo string) *exec.Cmd {
 			return withRepo(repo, "issue", "create")
 		}},
-		{Label: "List open PRs", Kind: PullRequests, Cmd: func(repo string) *exec.Cmd {
+		// Pull Requests
+		{Label: "List open PRs", Kind: PullRequests, Interactive: false, Cmd: func(repo string) *exec.Cmd {
 			return withRepo(repo, "pr", "list")
 		}},
-		{Label: "Create new PR", Kind: PullRequests, Cmd: func(repo string) *exec.Cmd {
+		{Label: "Create new PR", Kind: PullRequests, Interactive: true, Cmd: func(repo string) *exec.Cmd {
 			return withRepo(repo, "pr", "create")
 		}},
-		{Label: "Checkout a PR", Kind: PullRequests, Cmd: func(repo string) *exec.Cmd {
+		{Label: "Checkout a PR", Kind: PullRequests, Interactive: true, Cmd: func(repo string) *exec.Cmd {
 			return gh.NewCommand("pr", "checkout")
 		}},
-		{Label: "View repo summary", Kind: Repositories, Cmd: func(repo string) *exec.Cmd {
+		// Repositories
+		{Label: "View repo summary", Kind: Repositories, Interactive: false, Cmd: func(repo string) *exec.Cmd {
 			return withRepo(repo, "repo", "view")
 		}},
-		{Label: "Open in browser", Kind: Repositories, Cmd: func(repo string) *exec.Cmd {
+		{Label: "Open in browser", Kind: Repositories, Interactive: true, Cmd: func(repo string) *exec.Cmd {
 			return withRepo(repo, "browse")
 		}},
-		{Label: "List workflows", Kind: Workflows, Cmd: func(repo string) *exec.Cmd {
+		// Workflows
+		{Label: "List workflows", Kind: Workflows, Interactive: false, Cmd: func(repo string) *exec.Cmd {
 			return withRepo(repo, "workflow", "list")
 		}},
-		{Label: "List workflow runs", Kind: Workflows, Cmd: func(repo string) *exec.Cmd {
+		{Label: "List workflow runs", Kind: Workflows, Interactive: false, Cmd: func(repo string) *exec.Cmd {
 			return withRepo(repo, "run", "list")
 		}},
-		{Label: "View latest release", Kind: Releases, Cmd: func(repo string) *exec.Cmd {
+		// Releases
+		{Label: "View latest release", Kind: Releases, Interactive: false, Cmd: func(repo string) *exec.Cmd {
 			return withRepo(repo, "release", "view")
 		}},
-		{Label: "Create new release", Kind: Releases, Cmd: func(repo string) *exec.Cmd {
+		{Label: "Create new release", Kind: Releases, Interactive: true, Cmd: func(repo string) *exec.Cmd {
 			return withRepo(repo, "release", "create")
 		}},
-		{Label: "Push to main", Kind: Local, Cmd: func(repo string) *exec.Cmd {
-			return exec.Command("git", "push", "origin", "main")
+		// Local / Git
+		{Label: "Git status", Kind: Local, Interactive: false, Cmd: func(repo string) *exec.Cmd {
+			return exec.Command("git", "status", "-sb")
 		}},
-		{Label: "Push current branch", Kind: Local, Cmd: func(repo string) *exec.Cmd {
+		{Label: "Push current branch", Kind: Local, Interactive: false, Cmd: func(repo string) *exec.Cmd {
 			return exec.Command("git", "push", "origin", "HEAD")
 		}},
-		{Label: "List branches", Kind: Local, Cmd: func(repo string) *exec.Cmd {
+		{Label: "Force push (with lease)", Kind: Local, Interactive: false, Cmd: func(repo string) *exec.Cmd {
+			return exec.Command("git", "push", "--force-with-lease", "origin", "HEAD")
+		}},
+		{Label: "Pull (merge)", Kind: Local, Interactive: false, Cmd: func(repo string) *exec.Cmd {
+			return exec.Command("git", "pull", "origin", "HEAD")
+		}},
+		{Label: "Pull & rebase", Kind: Local, Interactive: false, Cmd: func(repo string) *exec.Cmd {
+			return exec.Command("git", "pull", "--rebase", "origin", "HEAD")
+		}},
+		{Label: "Pull unrelated histories", Kind: Local, Interactive: false, Cmd: func(repo string) *exec.Cmd {
+			return exec.Command("git", "pull", "origin", "HEAD", "--allow-unrelated-histories")
+		}},
+		{Label: "List branches", Kind: Local, Interactive: false, Cmd: func(repo string) *exec.Cmd {
 			return exec.Command("git", "branch", "-a", "--color")
 		}},
-		{Label: "View git log", Kind: Local, Cmd: func(repo string) *exec.Cmd {
+		{Label: "View git log", Kind: Local, Interactive: false, Cmd: func(repo string) *exec.Cmd {
 			return exec.Command("git", "log", "--oneline", "--graph", "-20", "--decorate", "--color")
 		}},
-		{Label: "List tags", Kind: Local, Cmd: func(repo string) *exec.Cmd {
+		{Label: "List tags", Kind: Local, Interactive: false, Cmd: func(repo string) *exec.Cmd {
 			return exec.Command("git", "tag", "-l", "-n1")
 		}},
-		{Label: "Checkout new branch", Kind: Local, Cmd: func(repo string) *exec.Cmd {
+		{Label: "Stash changes", Kind: Local, Interactive: false, Cmd: func(repo string) *exec.Cmd {
+			return exec.Command("git", "stash", "-m", "gh-gum stash")
+		}},
+		{Label: "Pop stash", Kind: Local, Interactive: false, Cmd: func(repo string) *exec.Cmd {
+			return exec.Command("git", "stash", "pop")
+		}},
+		{Label: "Checkout new branch", Kind: Local, Interactive: true, Cmd: func(repo string) *exec.Cmd {
 			return exec.Command("git", "checkout", "-b")
 		}},
 	}

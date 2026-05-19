@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -26,6 +27,8 @@ const (
 	screenManualRepo
 	screenMainMenu
 	screenBranchInput
+	screenCommitInput
+	screenOutput
 )
 
 // ---------- command list items ----------
@@ -93,18 +96,35 @@ type reposLoadedMsg struct {
 
 type execFinishedMsg struct{ err error }
 
+type cmdOutputMsg struct {
+	output string
+	err    error
+	label  string
+}
+
+type prePushStatusMsg struct {
+	hasChanges bool
+}
+
+type commitPushMsg struct {
+	output string
+	err    error
+}
+
 // ---------- model ----------
 
 type AppModel struct {
-	screen    screen
-	repo      string
-	repoList  list.Model
-	cmdList   list.Model
-	textInput textinput.Model
-	width     int
-	height    int
-	quitting  bool
-	lastErr   string
+	screen      screen
+	repo        string
+	repoList    list.Model
+	cmdList     list.Model
+	textInput   textinput.Model
+	outputVP    viewport.Model
+	outputTitle string
+	width       int
+	height      int
+	quitting    bool
+	lastErr     string
 }
 
 func NewAppModel() AppModel {
@@ -129,6 +149,15 @@ func newBranchInput() textinput.Model {
 	return ti
 }
 
+func newCommitInput() textinput.Model {
+	ti := textinput.New()
+	ti.Placeholder = "Your commit message"
+	ti.Focus()
+	ti.CharLimit = 120
+	ti.Width = 50
+	return ti
+}
+
 func (m AppModel) Init() tea.Cmd {
 	return detectRepoCmd()
 }
@@ -145,6 +174,47 @@ func detectRepoCmd() tea.Cmd {
 	}
 }
 
+// listAllReposCmd fetches every repo the user owns.
+func listAllReposCmd() tea.Cmd {
+	return func() tea.Msg {
+		repos, err := gh.ListMyRepos(30)
+		return reposLoadedMsg{repos: repos, err: err}
+	}
+}
+
+func gitStatusCheckCmd() tea.Cmd {
+	return func() tea.Msg {
+		out, err := exec.Command("git", "status", "--short").CombinedOutput()
+		if err != nil {
+			// git status may error in non-git dirs; treat as no changes.
+			return prePushStatusMsg{hasChanges: false}
+		}
+		return prePushStatusMsg{hasChanges: strings.TrimSpace(string(out)) != ""}
+	}
+}
+
+func commitAndPushCmd(msg string) tea.Cmd {
+	return func() tea.Msg {
+		var out strings.Builder
+		// Stage all changes.
+		addOut, err := exec.Command("git", "add", ".").CombinedOutput()
+		out.Write(addOut)
+		if err != nil {
+			return commitPushMsg{output: out.String(), err: err}
+		}
+		// Commit.
+		commitOut, err := exec.Command("git", "commit", "-m", msg).CombinedOutput()
+		out.Write(commitOut)
+		if err != nil {
+			return commitPushMsg{output: out.String(), err: err}
+		}
+		// Push.
+		pushOut, err := exec.Command("git", "push", "origin", "HEAD").CombinedOutput()
+		out.Write(pushOut)
+		return commitPushMsg{output: out.String(), err: err}
+	}
+}
+
 func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -157,7 +227,21 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case screenMainMenu:
 			m.cmdList.SetWidth(m.width)
 			m.cmdList.SetHeight(m.height)
+		case screenOutput:
+			m.outputVP.Width = m.width
+			m.outputVP.Height = m.height
 		}
+		return m, nil
+
+	case cmdOutputMsg:
+		m.outputTitle = msg.label
+		content := msg.output
+		if msg.err != nil {
+			content += "\n\n" + lipgloss.NewStyle().Foreground(ui.Danger).Render("Error: "+msg.err.Error())
+		}
+		m.outputVP = viewport.New(m.width, m.height)
+		m.outputVP.SetContent(content)
+		m.screen = screenOutput
 		return m, nil
 
 	case reposLoadedMsg:
@@ -171,6 +255,8 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.repo = msg.repos[0]
 			m.screen = screenMainMenu
 			m.cmdList = buildCmdList(m.repo, m.width, m.height)
+			// Also build repoList so pressing 'b' later doesn't panic on a zero-value list.
+			m.repoList = buildRepoList(msg.repos, m.width, m.height)
 			return m, nil
 		}
 		if len(msg.repos) == 0 {
@@ -188,6 +274,10 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if key.Matches(msg, m.repoList.KeyMap.Quit) && m.repoList.FilterState() != list.Filtering {
 				m.quitting = true
 				return m, tea.Quit
+			}
+			if msg.String() == "esc" && m.repo != "" && m.repoList.FilterState() != list.Filtering {
+				m.screen = screenMainMenu
+				return m, nil
 			}
 			if msg.String() == "n" && m.repoList.FilterState() != list.Filtering {
 				m.textInput = newTextInput()
@@ -266,14 +356,38 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.textInput, cmd = m.textInput.Update(msg)
 			return m, cmd
 
+		case screenCommitInput:
+			if msg.String() == "ctrl+c" || msg.String() == "q" {
+				m.quitting = true
+				return m, tea.Quit
+			}
+			if msg.String() == "esc" {
+				m.screen = screenMainMenu
+				return m, nil
+			}
+			if msg.String() == "enter" {
+				msgText := strings.TrimSpace(m.textInput.Value())
+				if msgText == "" {
+					msgText = m.textInput.Placeholder
+				}
+				if msgText == "" {
+					m.lastErr = "Commit message cannot be empty"
+					return m, nil
+				}
+				return m, commitAndPushCmd(msgText)
+			}
+			var cmd tea.Cmd
+			m.textInput, cmd = m.textInput.Update(msg)
+			return m, cmd
+
 		case screenMainMenu:
 			if key.Matches(msg, m.cmdList.KeyMap.Quit) && m.cmdList.FilterState() != list.Filtering {
 				m.quitting = true
 				return m, tea.Quit
 			}
 			if msg.String() == "b" && m.cmdList.FilterState() != list.Filtering {
-				m.screen = screenRepoSelector
-				return m, nil
+				// Fetch all repos so the user can switch to a different one.
+				return m, listAllReposCmd()
 			}
 			if msg.String() == "enter" && m.cmdList.FilterState() != list.Filtering {
 				if i, ok := m.cmdList.SelectedItem().(cmdItem); ok {
@@ -282,15 +396,49 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.screen = screenBranchInput
 						return m, nil
 					}
-					return m, tea.ExecProcess(i.action.Cmd(m.repo), func(err error) tea.Msg {
-						return execFinishedMsg{err: err}
-					})
+					if i.action.Label == "Push current branch" {
+						return m, gitStatusCheckCmd()
+					}
+					if i.action.Interactive {
+						return m, tea.ExecProcess(i.action.Cmd(m.repo), func(err error) tea.Msg {
+							return execFinishedMsg{err: err}
+						})
+					}
+					return m, captureOutputCmd(i.action.Cmd(m.repo), i.action.Label)
 				}
 			}
 			var cmd tea.Cmd
 			m.cmdList, cmd = m.cmdList.Update(msg)
 			return m, cmd
+
+		case screenOutput:
+			if msg.String() == "q" || msg.String() == "esc" || msg.String() == "b" {
+				m.screen = screenMainMenu
+				return m, nil
+			}
+			var cmd tea.Cmd
+			m.outputVP, cmd = m.outputVP.Update(msg)
+			return m, cmd
 		}
+
+	case prePushStatusMsg:
+		if !msg.hasChanges {
+			return m, captureOutputCmd(exec.Command("git", "push", "origin", "HEAD"), "Push current branch")
+		}
+		m.textInput = newCommitInput()
+		m.screen = screenCommitInput
+		return m, nil
+
+	case commitPushMsg:
+		m.outputTitle = "Commit & Push"
+		content := msg.output
+		if msg.err != nil {
+			content += "\n\n" + lipgloss.NewStyle().Foreground(ui.Danger).Render("Error: "+msg.err.Error())
+		}
+		m.outputVP = viewport.New(m.width, m.height)
+		m.outputVP.SetContent(content)
+		m.screen = screenOutput
+		return m, nil
 
 	case execFinishedMsg:
 		if msg.err != nil {
@@ -318,14 +466,26 @@ func (m AppModel) View() string {
 	case screenRepoSelector:
 		b.WriteString(m.repoList.View())
 		b.WriteString("\n")
-		help := fmt.Sprintf(
-			"%s %s · %s %s · %s %s · %s %s",
-			ui.HelpKeyStyle.Render("↑/k"), ui.HelpDescStyle.Render("up"),
-			ui.HelpKeyStyle.Render("↓/j"), ui.HelpDescStyle.Render("down"),
-			ui.HelpKeyStyle.Render("/"), ui.HelpDescStyle.Render("filter"),
-			ui.HelpKeyStyle.Render("n"), ui.HelpDescStyle.Render("manual"),
-		)
-		b.WriteString(ui.StatusBarStyle.Render(help))
+		if m.repo != "" {
+			help := fmt.Sprintf(
+				"%s %s · %s %s · %s %s · %s %s · %s %s",
+				ui.HelpKeyStyle.Render("↑/k"), ui.HelpDescStyle.Render("up"),
+				ui.HelpKeyStyle.Render("↓/j"), ui.HelpDescStyle.Render("down"),
+				ui.HelpKeyStyle.Render("/"), ui.HelpDescStyle.Render("filter"),
+				ui.HelpKeyStyle.Render("n"), ui.HelpDescStyle.Render("manual"),
+				ui.HelpKeyStyle.Render("esc"), ui.HelpDescStyle.Render("back to menu"),
+			)
+			b.WriteString(ui.StatusBarStyle.Render(help))
+		} else {
+			help := fmt.Sprintf(
+				"%s %s · %s %s · %s %s · %s %s",
+				ui.HelpKeyStyle.Render("↑/k"), ui.HelpDescStyle.Render("up"),
+				ui.HelpKeyStyle.Render("↓/j"), ui.HelpDescStyle.Render("down"),
+				ui.HelpKeyStyle.Render("/"), ui.HelpDescStyle.Render("filter"),
+				ui.HelpKeyStyle.Render("n"), ui.HelpDescStyle.Render("manual"),
+			)
+			b.WriteString(ui.StatusBarStyle.Render(help))
+		}
 
 	case screenManualRepo:
 		b.WriteString(ui.TitleStyle.Render("Enter repository"))
@@ -366,6 +526,32 @@ func (m AppModel) View() string {
 			"%s %s · %s %s",
 			ui.HelpKeyStyle.Render("enter"), ui.HelpDescStyle.Render("confirm"),
 			ui.HelpKeyStyle.Render("esc"), ui.HelpDescStyle.Render("back"),
+		)
+		b.WriteString(ui.StatusBarStyle.Render(help))
+
+	case screenCommitInput:
+		b.WriteString(ui.TitleStyle.Render("Uncommitted changes detected"))
+		b.WriteString("\n\n")
+		b.WriteString(ui.SubtitleStyle.Render("Enter a commit message to stage, commit, and push"))
+		b.WriteString("\n\n")
+		b.WriteString(m.textInput.View())
+		b.WriteString("\n")
+		help := fmt.Sprintf(
+			"%s %s · %s %s",
+			ui.HelpKeyStyle.Render("enter"), ui.HelpDescStyle.Render("commit & push"),
+			ui.HelpKeyStyle.Render("esc"), ui.HelpDescStyle.Render("cancel"),
+		)
+		b.WriteString(ui.StatusBarStyle.Render(help))
+
+	case screenOutput:
+		b.WriteString(ui.TitleStyle.Render(m.outputTitle))
+		b.WriteString("\n")
+		b.WriteString(m.outputVP.View())
+		b.WriteString("\n")
+		help := fmt.Sprintf(
+			"%s %s · %s %s",
+			ui.HelpKeyStyle.Render("↑/↓/pgup/pgdn"), ui.HelpDescStyle.Render("scroll"),
+			ui.HelpKeyStyle.Render("q/esc/b"), ui.HelpDescStyle.Render("back"),
 		)
 		b.WriteString(ui.StatusBarStyle.Render(help))
 	}
@@ -449,6 +635,13 @@ func buildCmdList(repo string, width, height int) list.Model {
 }
 
 // Run starts the Bubble Tea program.
+func captureOutputCmd(cmd *exec.Cmd, label string) tea.Cmd {
+	return func() tea.Msg {
+		out, err := cmd.CombinedOutput()
+		return cmdOutputMsg{output: string(out), err: err, label: label}
+	}
+}
+
 func Run() error {
 	p := tea.NewProgram(NewAppModel(), tea.WithAltScreen())
 	_, err := p.Run()
