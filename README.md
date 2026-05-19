@@ -39,14 +39,14 @@ gh extensions are just binaries named gh-<extension> placed in a specific direct
 
 bash
 # Build the binary with the exact name gh expects
-go build -o gh-gum.exe .
- 
+go build -o gh-gum.exe . # or go build -o gh-gum.exe . 2>&1
+
 # Create the local extension directory
 mkdir "%LOCALAPPDATA%\GitHub CLI\extensions\gh-gum"
- 
+
 # Copy the binary there
 copy gh-gum.exe "%LOCALAPPDATA%\GitHub CLI\extensions\gh-gum\"
- 
+
 # Now gh recognizes it
 # gh gum
 # or

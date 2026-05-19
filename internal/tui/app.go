@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -117,6 +118,11 @@ type commitPushMsg struct {
 	err    error
 }
 
+type checksPassedMsg struct {
+	output string
+	err    error
+}
+
 type commitsLoadedMsg struct {
 	commits []string
 	err     error
@@ -147,6 +153,9 @@ type AppModel struct {
 	fetchCommit     string
 	fetchPath       string
 	fetchTempDir    string
+	fetchFlowActive bool
+	// smart push state.
+	pendingSmartPush bool
 	// loading indicator.
 	loading     bool
 	loadingText string
@@ -244,6 +253,81 @@ func commitAndPushCmd(msg string) tea.Cmd {
 		pushOut, err := exec.Command("git", "push", "origin", "HEAD").CombinedOutput()
 		out.Write(pushOut)
 		return commitPushMsg{output: out.String(), err: err}
+	}
+}
+
+type projectChecks struct {
+	buildCmd *exec.Cmd
+	testCmd  *exec.Cmd
+}
+
+func hasNPMScript(name string) bool {
+	data, err := os.ReadFile("package.json")
+	if err != nil {
+		return false
+	}
+	var pkg struct {
+		Scripts map[string]string `json:"scripts"`
+	}
+	if err := json.Unmarshal(data, &pkg); err != nil {
+		return false
+	}
+	_, ok := pkg.Scripts[name]
+	return ok
+}
+
+func detectProjectChecks() *projectChecks {
+	if _, err := os.Stat("package.json"); err == nil {
+		var buildCmd, testCmd *exec.Cmd
+		if hasNPMScript("build") {
+			buildCmd = exec.Command("npm", "run", "build")
+		}
+		if hasNPMScript("test") {
+			testCmd = exec.Command("npm", "test")
+		}
+		if buildCmd != nil || testCmd != nil {
+			return &projectChecks{buildCmd: buildCmd, testCmd: testCmd}
+		}
+		return nil
+	}
+	if _, err := os.Stat("go.mod"); err == nil {
+		return &projectChecks{
+			buildCmd: exec.Command("go", "build", "./..."),
+			testCmd:  exec.Command("go", "test", "./..."),
+		}
+	}
+	if _, err := os.Stat("Cargo.toml"); err == nil {
+		return &projectChecks{
+			buildCmd: exec.Command("cargo", "build"),
+			testCmd:  exec.Command("cargo", "test"),
+		}
+	}
+	return nil
+}
+
+func runChecksCmd() tea.Cmd {
+	return func() tea.Msg {
+		var out strings.Builder
+		checks := detectProjectChecks()
+		if checks == nil {
+			return checksPassedMsg{output: "No build/test checks detected for this project type.", err: nil}
+		}
+		if checks.buildCmd != nil {
+			buildOut, err := checks.buildCmd.CombinedOutput()
+			out.WriteString(fmt.Sprintf("=== Build ===\n%s\n", string(buildOut)))
+			if err != nil {
+				return checksPassedMsg{output: out.String(), err: fmt.Errorf("build failed: %w", err)}
+			}
+		}
+		if checks.testCmd != nil {
+			testOut, err := checks.testCmd.CombinedOutput()
+			out.WriteString(fmt.Sprintf("=== Tests ===\n%s\n", string(testOut)))
+			if err != nil {
+				return checksPassedMsg{output: out.String(), err: fmt.Errorf("tests failed: %w", err)}
+			}
+		}
+		out.WriteString("All checks passed.\n")
+		return checksPassedMsg{output: out.String(), err: nil}
 	}
 }
 
@@ -434,8 +518,12 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case screenFetchRepoList, screenFetchCommitList, screenFetchFileList:
 		}
 		return m, nil
-	// ...
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		return m, cmd
 	case cmdOutputMsg:
+		m.loading = false
 		m.outputTitle = msg.label
 		content := msg.output
 		if msg.err != nil {
@@ -451,7 +539,8 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.lastErr = fmt.Sprintf("Could not load repos: %v", msg.err)
 			// If we were loading repos for the fetch flow, go back to main menu.
-			if m.screen == screenFetchRepoList {
+			if m.fetchFlowActive {
+				m.fetchFlowActive = false
 				m.screen = screenMainMenu
 				return m, nil
 			}
@@ -460,7 +549,8 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		// Fetch flow: populate picker with repos.
-		if m.screen == screenFetchRepoList || (m.screen == screenMainMenu && m.fetchSourceRepo == "" && m.fetchCommit == "") {
+		if m.fetchFlowActive {
+			m.fetchFlowActive = false
 			var items []list.Item
 			for _, r := range msg.repos {
 				items = append(items, homeItem{label: r, isRepo: true, repo: r})
@@ -608,6 +698,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if msg.String() == "esc" && m.pickerList.FilterState() != list.Filtering {
 				m.cleanupFetchTemp()
+				m.fetchFlowActive = false
 				m.screen = screenMainMenu
 				return m, nil
 			}
@@ -642,6 +733,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 			if msg.String() == "esc" && m.pickerList.FilterState() != list.Filtering {
+				m.fetchFlowActive = true
 				m.screen = screenFetchRepoList
 				return m, nil
 			}
@@ -665,6 +757,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 			if msg.String() == "esc" && m.pickerList.FilterState() != list.Filtering {
+				m.fetchFlowActive = true
 				m.screen = screenFetchCommitList
 				return m, nil
 			}
@@ -699,11 +792,17 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if i.action.Label == "Push current branch" {
 						return m, gitStatusCheckCmd()
 					}
+					if i.action.Label == "Smart push (checks + push)" {
+						m.loading = true
+						m.loadingText = "Running build & test checks..."
+						return m, tea.Batch(runChecksCmd(), m.spinner.Tick)
+					}
 					if i.action.Label == "Fetch file/folder from commit" {
 						m.cleanupFetchTemp()
 						m.fetchSourceRepo = ""
 						m.fetchCommit = ""
 						m.fetchPath = ""
+						m.fetchFlowActive = true
 						// Show repo picker; preload current repo if known.
 						m.loading = true
 						m.loadingText = "Loading repositories..."
@@ -723,6 +822,14 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case screenOutput:
 			if msg.String() == "q" || msg.String() == "esc" || msg.String() == "b" {
+				if m.pendingSmartPush {
+					m.pendingSmartPush = false
+					return m, gitStatusCheckCmd()
+				}
+				m.fetchFlowActive = false
+				m.fetchSourceRepo = ""
+				m.fetchCommit = ""
+				m.fetchPath = ""
 				m.screen = screenMainMenu
 				return m, nil
 			}
@@ -748,6 +855,23 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.outputVP = viewport.New(m.width, m.height)
 		m.outputVP.SetContent(content)
+		m.screen = screenOutput
+		return m, nil
+
+	case checksPassedMsg:
+		m.loading = false
+		if msg.err != nil {
+			m.outputTitle = "Pre-push checks failed"
+			content := msg.output + "\n\n" + lipgloss.NewStyle().Foreground(ui.Danger).Render("Error: "+msg.err.Error())
+			m.outputVP = viewport.New(m.width, m.height)
+			m.outputVP.SetContent(content)
+			m.screen = screenOutput
+			return m, nil
+		}
+		m.pendingSmartPush = true
+		m.outputTitle = "Pre-push checks passed"
+		m.outputVP = viewport.New(m.width, m.height)
+		m.outputVP.SetContent(msg.output + "\n\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF00")).Render("All checks passed. Press any key to continue to push."))
 		m.screen = screenOutput
 		return m, nil
 

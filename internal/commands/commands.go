@@ -17,6 +17,8 @@ const (
 	Workflows
 	Releases
 	Local
+	Copilot
+	Agents
 )
 
 func (k Kind) String() string {
@@ -33,6 +35,10 @@ func (k Kind) String() string {
 		return "Releases"
 	case Local:
 		return "Local"
+	case Copilot:
+		return "Copilot"
+	case Agents:
+		return "Agents"
 	default:
 		return "Unknown"
 	}
@@ -99,6 +105,9 @@ func Actions() []Action {
 		{Label: "Push current branch", Kind: Local, Interactive: false, Cmd: func(repo string) *exec.Cmd {
 			return exec.Command("git", "push", "origin", "HEAD")
 		}},
+		{Label: "Smart push (checks + push)", Kind: Local, Interactive: false, Cmd: func(repo string) *exec.Cmd {
+			return exec.Command("echo", "handled in TUI")
+		}},
 		{Label: "Force push (with lease)", Kind: Local, Interactive: false, Cmd: func(repo string) *exec.Cmd {
 			return exec.Command("git", "push", "--force-with-lease", "origin", "HEAD")
 		}},
@@ -132,6 +141,20 @@ func Actions() []Action {
 		{Label: "Checkout new branch", Kind: Local, Interactive: true, Cmd: func(repo string) *exec.Cmd {
 			return exec.Command("git", "checkout", "-b")
 		}},
+		// Copilot
+		{Label: "Copilot suggest", Kind: Copilot, Interactive: true, Cmd: func(repo string) *exec.Cmd {
+			return gh.NewCommand("copilot", "suggest")
+		}},
+		{Label: "Copilot explain", Kind: Copilot, Interactive: true, Cmd: func(repo string) *exec.Cmd {
+			return gh.NewCommand("copilot", "explain")
+		}},
+		// Agents
+		// {Label: "List agent skills", Kind: Agents, Interactive: false, Cmd: func(repo string) *exec.Cmd {
+		// 	return gh.NewCommand("skill", "list")
+		// }},
+		// {Label: "Install agent skill", Kind: Agents, Interactive: true, Cmd: func(repo string) *exec.Cmd {
+		// 	return gh.NewCommand("skill", "install")
+		// }},
 	}
 }
 
